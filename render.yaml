@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: excalibur-rpc-node
+    env: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 9332
