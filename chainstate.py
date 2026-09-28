@@ -16,7 +16,8 @@ from genesis_fork import (GENESIS, genesis_for, genesis_txs,
                           verify_genesis, use_network, NETWORKS,
                           ser_header, sha256d, txid, merkle_root,
                           bits_to_target, required_bits, subsidy,
-                          check_coinbase_lineage, validate_block)
+                          check_coinbase_lineage, validate_block,
+                          _parse_pushes)
 from txscript import (validate_block_txs, apply_block_txs, build_utxo,
                       utxo_stats)
 from utxodb import UtxoSet, SnapshotDB, build_snapshot_db
@@ -27,9 +28,32 @@ def _fork_snapshot_paths(data_dir):
     snap_dir = os.path.join(here, "fork_balances")
     return {
         "dat": os.path.join(snap_dir, "snapshot_968698.dat"),
-        "meta": os.path.join(snap_dir, "snapshot.json"),
+        "meta": os.path.join(snap_dir, "snapshot_968698.json"),
+        "meta_legacy": os.path.join(snap_dir, "snapshot.json"),
+        "activation": os.path.join(snap_dir, "activation.json"),
         "db": os.path.join(data_dir, "utxo.db"),
     }
+
+
+def activation_commitment(height, data_dir):
+    """Snapshot hash bytes to commit in the coinbase at `height`, or None.
+
+    Reads fork_balances/activation.json (written by the snapshot pipeline).
+    Returns None unless height == activation_height, so normal blocks are
+    unaffected. Used by the miner when building the activation block.
+    """
+    p = _fork_snapshot_paths(data_dir)
+    try:
+        with open(p["activation"]) as f:
+            act = json.load(f)
+    except (OSError, ValueError):
+        return None
+    try:
+        if int(act.get("activation_height", -1)) != height:
+            return None
+        return bytes.fromhex(act["snapshot_hash"])
+    except (ValueError, TypeError):
+        return None
 
 
 def _block_work(bits):
@@ -69,6 +93,8 @@ class ChainState:
         self.tips = []       # [{"height","hash","work"}] by work desc
         self.utxo = None     # UtxoSet; built in load()
         self._snapshot = None  # SnapshotDB (fork net only)
+        self._snapshot_hash = None      # bytes: sha256d of snapshot_968698.dat
+        self._activation_height = None  # fork height where snapshot activates
         # COMPAT SHIM (2026-09-26, Bodhi): another builder is mid-flight on
         # fork_balances/ (snapshot not built yet) and made the snapshot a
         # hard startup requirement, which crash-loops the node. Until the
@@ -204,13 +230,18 @@ class ChainState:
 
         Returns None when no snapshot has been built yet (see the compat
         shim in __init__): the node then runs on fork blocks alone.
+
+        Also loads the activation config (activation.json): the snapshot
+        only becomes the UTXO base at activation_height, and the activation
+        block's coinbase must push the snapshot hash.
         """
         p = _fork_snapshot_paths(self.data_dir)
-        if not os.path.exists(p["meta"]):
-            print("snapshot: fork_balances/snapshot.json not built yet — "
-                  "running on fork blocks only", flush=True)
+        meta_path = p["meta"] if os.path.exists(p["meta"]) else p["meta_legacy"]
+        if not os.path.exists(meta_path):
+            print("snapshot: fork_balances/snapshot_968698.json not built "
+                  "yet — running on fork blocks only", flush=True)
             return None
-        with open(p["meta"]) as f:
+        with open(meta_path) as f:
             meta = json.load(f)
         if not os.path.exists(p["db"]):
             build_snapshot_db(p["dat"], p["db"], meta["sha256d"],
@@ -220,18 +251,46 @@ class ChainState:
             db.close()
             raise RuntimeError("snapshot DB hash mismatch: delete utxo.db "
                                "and rebuild")
+        # Activation gating: snapshot activates at a future fork height,
+        # committed in that block's coinbase. Before that height the node
+        # runs on fork blocks alone (preserving existing history).
+        self._snapshot_hash = bytes.fromhex(meta["sha256d"])
+        self._activation_height = None
+        if os.path.exists(p["activation"]):
+            with open(p["activation"]) as f:
+                act = json.load(f)
+            if act.get("snapshot_hash") != meta["sha256d"]:
+                db.close()
+                raise RuntimeError(
+                    "activation.json snapshot_hash does not match "
+                    "snapshot_968698.json")
+            self._activation_height = int(act["activation_height"])
+            print(f"snapshot: activation at fork height "
+                  f"{self._activation_height}, hash "
+                  f"{meta['sha256d'][:16]}..", flush=True)
+        else:
+            print("snapshot: built but activation.json missing — "
+                  "running on fork blocks only", flush=True)
         return db
 
+    def _snapshot_active_at(self, height):
+        """True if the snapshot is the UTXO base at fork `height`."""
+        return (self._snapshot is not None
+                and self._activation_height is not None
+                and height >= self._activation_height)
+
     def _replay_active(self):
-        # Fork net: the height-0 state is the Bitcoin snapshot (the genesis
-        # record itself carries no txs); other nets start empty.
+        # Fork net: before the snapshot activation height the state is
+        # fork blocks alone (history is preserved); at/after activation
+        # the Bitcoin snapshot becomes the base beneath the fork overlay.
         base = None
         if self.net == "fork":
             if self._snapshot is None and not self._snapshot_unavailable:
                 self._snapshot = self._open_snapshot()
                 if self._snapshot is None:
                     self._snapshot_unavailable = True
-            if self._snapshot is not None:
+            tip_height = self.index[self._tip_hash]["height"]
+            if self._snapshot_active_at(tip_height):
                 base = UtxoSet(snapshot=self._snapshot)
         path = self._path_to(self._tip_hash)
         self.utxo = build_utxo([{"txs": rec["txs"]} for rec in path],
@@ -259,7 +318,12 @@ class ChainState:
     def _fork_utxo(self, prev_hash):
         """UTXO set as of the block prev_hash. Tip case is a cheap copy
         (the snapshot is shared); side branches replay fork blocks over a
-        fresh overlay (fork history is short)."""
+        fresh overlay (fork history is short).
+
+        The snapshot is the base only when the child height reaches the
+        activation height; earlier blocks validate against fork history
+        alone, exactly as they did before the snapshot existed.
+        """
         if prev_hash == self._tip_hash:
             return self.utxo.copy()
         base = None
@@ -268,10 +332,34 @@ class ChainState:
                 self._snapshot = self._open_snapshot()
                 if self._snapshot is None:
                     self._snapshot_unavailable = True
-            if self._snapshot is not None:
+            prev_height = self.index[prev_hash]["height"]
+            if self._snapshot_active_at(prev_height + 1):
                 base = UtxoSet(snapshot=self._snapshot)
         path = self._path_to(prev_hash)
         return build_utxo([{"txs": rec["txs"]} for rec in path], base=base)
+
+    def _check_activation_commitment(self, txs, height):
+        """At the snapshot activation height the coinbase scriptSig must
+        push the snapshot hash (32 bytes). Returns None if OK (or not the
+        activation height), else an error string."""
+        if height != self._activation_height:
+            return None
+        if self._snapshot_hash is None:
+            return "activation height reached but snapshot not loaded"
+        try:
+            cb = txs[0]
+            # scriptSig starts after: version(4) + vin_count(1) +
+            # prev_txid(32) + prev_vout(4)
+            off = 4 + 1 + 32 + 4
+            slen = cb[off]
+            off += 1
+            script = cb[off:off + slen]
+            pushes = _parse_pushes(script)
+        except Exception:
+            return "activation block: cannot parse coinbase scriptSig"
+        if self._snapshot_hash not in pushes:
+            return "activation block: coinbase missing snapshot hash commitment"
+        return None
 
     # -------------------------------------------------------------- submit
     def submit_block(self, blk):
@@ -301,6 +389,9 @@ class ChainState:
                     "reason": "duplicate block"}
         fork_utxo = self._fork_utxo(prev_hash)
         path = self._path_to(prev_hash)
+        bad = self._check_activation_commitment(txs, height)
+        if bad:
+            return {"accepted": False, "event": None, "reason": bad}
         bad = validate_block(norm, prev, height, path, utxo=fork_utxo)
         if bad:
             return {"accepted": False, "event": None, "reason": bad}

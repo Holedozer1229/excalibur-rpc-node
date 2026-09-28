@@ -92,7 +92,7 @@ def txid_display(tx: bytes) -> str:
 
 # ---------------------------------------------------------------- coinbase v2
 def make_coinbase_v2(height: int, bits: int, tag: bytes, fees: int = 0,
-                   miner_pubkey: bytes = None) -> bytes:
+                   miner_pubkey: bytes = None, extra_pushes: list = None) -> bytes:
     """Coinbase with a BIP34-style height push: scriptSig =
     push(LE(bits)) + push(tag) + push(LE(height)). First push still LE(bits),
     so check_coinbase_lineage passes; the height push makes the txid unique
@@ -103,10 +103,18 @@ def make_coinbase_v2(height: int, bits: int, tag: bytes, fees: int = 0,
     directly — solo miners need no pool. Without it, the opcode-free OPEN
     lock is used (anyone-can-spend, e.g. for historical or custodial
     issuance).
+
+    extra_pushes: optional list of byte strings appended as extra scriptSig
+    pushes after the height push (e.g. the UTXO snapshot hash commitment
+    at the snapshot activation height). check_coinbase_lineage only
+    constrains pushes[0], so extra pushes are consensus-safe.
     """
     from genesis_fork import make_coinbase as _mk
     scriptsig = (push(struct.pack("<I", bits)) + push(tag)
                  + push(struct.pack("<I", height)))
+    if extra_pushes:
+        for e in extra_pushes:
+            scriptsig += push(bytes(e))
     tx = struct.pack("<I", 1)
     tx += b"\x01"
     tx += bytes(32) + struct.pack("<I", 0xffffffff)
