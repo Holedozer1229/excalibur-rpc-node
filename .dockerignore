@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+chaindata
+chaindata_mainnet
+chaindata_fork
+*.log
+.bridge_token

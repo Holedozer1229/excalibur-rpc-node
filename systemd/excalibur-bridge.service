@@ -1,0 +1,18 @@
+[Unit]
+Description=Excalibur RPC bridge (authenticated)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hatch/workspace
+UMask=0007
+Environment=HOME=/home/hatch
+ExecStart=/usr/bin/python3 bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/hatch/workspace/excalibur_bridge.log
+StandardError=append:/home/hatch/workspace/excalibur_bridge.log
+
+[Install]
+WantedBy=multi-user.target

@@ -14,15 +14,25 @@ gossip too, so a bootstrap seed is only needed for first contact; once a
 node knows one peer it discovers the rest and the seed can disappear.
 
 On receiving a block the node validates it under fork consensus and relays
-it. Orphans trigger a getblock for the missing parent (header-first lite
-sync). All chainstate/mempool access goes through the shared lock.
+it. Orphans are pooled while a getblock walks back for the missing parent;
+once the parent attaches, pooled children replay forward, so a node that
+connects far behind the tip catches up fully (header-first lite sync).
+All chainstate/mempool access goes through the shared lock.
 """
 import json
 import socket
 import struct
 import threading
 
-from txscript import txid_internal
+from txscript import txid_internal, validate_tx, _view_copy
+from genesis_fork import ser_header, sha256d
+
+
+def _blk_hash(blk):
+    """Header hash of a _blk_from_json block dict (same as consensus)."""
+    return sha256d(ser_header(blk["version"], bytes(blk["prev"]),
+                              bytes(blk["merkle"]), blk["time"],
+                              blk["bits"], blk["nonce"]))
 
 
 def _blk_to_json(blk):
@@ -100,6 +110,18 @@ class PeerManager:
         self.known = set()  # "host:port" strings learned via gossip/bootstrap
         self._stop = threading.Event()
         self._srv = None
+        # Optional callback(height, [(vsize, fee), ...]) fired for every
+        # accepted block. Node-local statistics (estimatesmartfee fuel);
+        # never consensus. excalibur.py wires it to Node.record_block_fees.
+        self.on_block = None
+        # Orphan pool: blocks whose parent we haven't fetched yet during
+        # catch-up sync. _orphans: block_hash -> block dict;
+        # _orphan_kids: prev_hash -> {block_hash}. When a parent is
+        # accepted, pooled children are retried in order, so a node that
+        # connects far behind the tip walks back to common history and
+        # then replays forward to the tip. Bounded (2000); oldest evicted.
+        self._orphans = {}
+        self._orphan_kids = {}
 
     # ------------------------------------------------------------------
     def start(self):
@@ -127,6 +149,9 @@ class PeerManager:
         if self._srv is None:
             raise OSError("p2p: cannot bind listen socket")
         self._srv.settimeout(0.5)
+        # Actual bound port (differs from the requested one when port=0).
+        # Hellos advertise this, and the self-dial guard depends on it.
+        self.port = self._srv.getsockname()[1]
         t = threading.Thread(target=self._accept_loop, daemon=True)
         t.start()
 
@@ -141,6 +166,10 @@ class PeerManager:
             self._add_peer(conn, addr)
 
     def connect(self, host, port):
+        # Remember the address up front: a failed bootstrap must not erase
+        # the address, or the redial thread (which keys on self.known)
+        # will never retry it.
+        self.known.add(_fmt_addr(host, port))
         last = None
         try:
             ais = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
@@ -242,6 +271,16 @@ class PeerManager:
                              "addrs": sorted(self.known)[:20]})
             except OSError:
                 pass
+            # ...and with our unconfirmed transactions, so a node that
+            # connects late still learns the mempool (dedup on arrival;
+            # relayed onward minus the sender, as usual).
+            try:
+                with self.lock:
+                    pending = list(self.mempool.txs.values())[:1000]
+                for raw in pending:
+                    _send(sock, {"t": "tx", "tx": raw.hex()})
+            except OSError:
+                pass
         elif t == "addr":
             for a in msg.get("addrs", [])[:20]:
                 if isinstance(a, str) and a not in self.known:
@@ -263,15 +302,21 @@ class PeerManager:
         elif t == "block":
             blk = _blk_from_json(msg["block"])
             with self.lock:
+                fee_info = self._measure_fees(blk)
                 sub = self.cs.submit_block(blk)
                 ev = sub.get("event")
                 if sub["accepted"] and ev:
                     self._apply_reorg_side_effects(ev)
+                blk_hash = _blk_hash(blk) if sub["accepted"] else None
+                if (not sub["accepted"]
+                        and sub.get("reason", "").startswith("orphan")):
+                    self._store_orphan(blk)
+                    _send(sock, {"t": "getblock",
+                                 "hash": blk["prev"].hex()})
             if sub["accepted"]:
-                self._relay(blk, exclude=sock)
-            elif sub.get("reason", "").startswith("orphan"):
-                _send(sock, {"t": "getblock",
-                             "hash": blk["prev"].hex()})
+                self._post_accept(blk, blk_hash, fee_info, exclude=sock)
+            # duplicate/invalid: nothing to do (walk-back only chases
+            # unknown parents)
         elif t == "tx":
             try:
                 raw = bytes.fromhex(msg["tx"])
@@ -282,6 +327,90 @@ class PeerManager:
                     raw, self.cs.utxo, self.cs.tip()["height"] + 1)
             if ok:
                 self._relay_tx(raw, exclude=sock)
+
+    def _measure_fees(self, blk):
+        """Per-tx (vsize, fee) for a block about to be submitted. Must be
+        measured BEFORE submit_block spends the inputs. Node-local stats
+        only; failures yield None and never affect consensus. Lock held."""
+        try:
+            # Height comes from the prev record; p2p block dicts carry no
+            # height field. For orphans (prev unknown) this is an
+            # approximation — drained blocks are re-measured at accept.
+            prev = self.cs.index.get(bytes(blk["prev"]))
+            vh = (prev["height"] + 1 if prev is not None
+                  else self.cs.tip()["height"] + 1)
+            view = _view_copy(self.cs.utxo)
+            out = []
+            for tx in blk["txs"][1:]:
+                ok, _, fee = validate_tx(tx, self.cs.utxo, vh, view=view)
+                if not ok:
+                    return None
+                out.append((len(tx), fee))
+            return out
+        except Exception:
+            return None
+
+    def _note_fees(self, blk, fee_info):
+        """Fire the on_block fee hook for an accepted block. Lock held."""
+        if fee_info is None or self.on_block is None:
+            return
+        try:
+            prev = self.cs.index.get(bytes(blk["prev"]))
+            bh = (prev["height"] + 1 if prev is not None
+                  else self.cs.tip()["height"])
+            cb = self.on_block
+        except Exception as e:
+            self.log(f"p2p: on_block hook failed: {e}")
+            return
+        try:
+            cb(bh, fee_info)
+        except Exception as e:
+            self.log(f"p2p: on_block hook failed: {e}")
+
+    def _store_orphan(self, blk):
+        """Pool a block whose parent is still missing (catch-up sync).
+        Lock held. Bounded: oldest entries are evicted first."""
+        try:
+            hh, ph = _blk_hash(blk), bytes(blk["prev"])
+        except Exception:
+            return
+        if hh in self._orphans:
+            return
+        while len(self._orphans) >= 2000:
+            old = next(iter(self._orphans))
+            del self._orphans[old]
+        self._orphans[hh] = blk
+        self._orphan_kids.setdefault(ph, set()).add(hh)
+
+    def _post_accept(self, blk, blk_hash, fee_info, exclude=None):
+        """Relay + fee stats + orphan drain for an accepted block.
+        Called without the lock held."""
+        self._relay(blk, exclude=exclude)
+        with self.lock:
+            self._note_fees(blk, fee_info)
+            self._drain_orphans(blk_hash)
+
+    def _drain_orphans(self, start_hash):
+        """Retry pooled orphans whose parent chain just became known,
+        cascading forward. Lock held. Orphans that still don't attach
+        (invalid, or competing side branch) are dropped, never stuck."""
+        queue = [start_hash]
+        while queue:
+            for kh in self._orphan_kids.pop(queue.pop(), ()):
+                child = self._orphans.pop(kh, None)
+                if child is None:
+                    continue  # evicted or already drained
+                fee_info = self._measure_fees(child)
+                sub = self.cs.submit_block(child)
+                if not sub["accepted"]:
+                    if sub.get("reason", "").startswith("orphan"):
+                        self._store_orphan(child)  # parent on side branch
+                    continue  # invalid / duplicate / reorg-guarded: drop
+                if sub.get("event"):
+                    self._apply_reorg_side_effects(sub["event"])
+                self._relay(child)
+                self._note_fees(child, fee_info)
+                queue.append(kh)
 
     def _relay(self, blk, exclude=None):
         msg = {"t": "block", "block": _blk_to_json(blk)}
@@ -343,6 +472,22 @@ class PeerManager:
 
     def peer_count(self):
         return len(self.peers)
+
+    def start_redial(self, interval=30):
+        """Background thread: if we have no peers but know addresses
+        (bootstrap or gossiped), retry them periodically. Keeps a node
+        reconnected across peer restarts without manual intervention."""
+        def loop():
+            while not self._stop.is_set():
+                self._stop.wait(interval)
+                if self._stop.is_set():
+                    break
+                try:
+                    if self.peer_count() == 0 and self.known:
+                        self._dial_gossiped()
+                except Exception as e:
+                    self.log(f"p2p: redial failed: {e}")
+        threading.Thread(target=loop, daemon=True).start()
 
     def shutdown(self):
         self._stop.set()

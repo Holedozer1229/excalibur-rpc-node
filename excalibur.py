@@ -36,7 +36,7 @@ from genesis_fork import (GENESIS, PARAMS, make_coinbase, merkle_root,
 from txscript import (build_utxo, apply_block_txs, make_coinbase_v2,
                       validate_block_txs, utxo_stats)
 from mempool import Mempool
-from chainstate import ChainState
+from chainstate import ChainState, activation_commitment
 from p2p import PeerManager
 from node_rpc import Node, load_wallet_key
 
@@ -48,6 +48,8 @@ SUMMARY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "genesis_fork_chain.json")
 SPACING = 600
 STOP = False
+
+NODE_VERSION = "0.2.0"
 
 
 def _sig(_s, _f):
@@ -139,7 +141,7 @@ def _grind_range(job, result_q, stop_ev):
 
 def mine_one_parallel(prev: dict, height: int, cs: ChainState, tag: bytes,
                       template: list, utxo_snap: dict, workers: int,
-                      miner_pubkey: bytes = None):
+                      miner_pubkey: bytes = None, extra_pushes: list = None):
     """mine_one, but the 2^32 nonce space is split across worker processes.
 
     Block construction, timestamps, difficulty and validation are identical
@@ -152,7 +154,8 @@ def mine_one_parallel(prev: dict, height: int, cs: ChainState, tag: bytes,
     bits = required_bits(height, cs._bits_context(prev_hash, height), t)
     mem_txs = [raw for raw, _fee in template]
     fees = sum(fee for _raw, fee in template)
-    cb = make_coinbase_v2(height, bits, tag, fees, miner_pubkey)
+    cb = make_coinbase_v2(height, bits, tag, fees, miner_pubkey,
+                          extra_pushes=extra_pushes)
     assert check_coinbase_lineage(cb, bits)
     txs = [cb] + mem_txs
     ok, reason, _ = validate_block_txs(txs, utxo_snap, height,
@@ -209,7 +212,8 @@ def mine_one_parallel(prev: dict, height: int, cs: ChainState, tag: bytes,
 
 
 def mine_one(prev: dict, height: int, cs: ChainState, tag: bytes,
-             template: list, utxo_snap: dict, miner_pubkey: bytes = None):
+             template: list, utxo_snap: dict, miner_pubkey: bytes = None,
+             extra_pushes: list = None):
     """Grind one block; roll ntime if the nonce space ever exhausts.
 
     template: list of (raw_tx, fee) mempool txs, already validated at
@@ -225,7 +229,8 @@ def mine_one(prev: dict, height: int, cs: ChainState, tag: bytes,
     bits = required_bits(height, cs._bits_context(prev_hash, height), t)
     mem_txs = [raw for raw, _fee in template]
     fees = sum(fee for _raw, fee in template)
-    cb = make_coinbase_v2(height, bits, tag, fees, miner_pubkey)
+    cb = make_coinbase_v2(height, bits, tag, fees, miner_pubkey,
+                          extra_pushes=extra_pushes)
     assert check_coinbase_lineage(cb, bits)
     txs = [cb] + mem_txs
     ok, reason, _ = validate_block_txs(txs, utxo_snap, height,
@@ -273,7 +278,10 @@ def main():
                     help="disable the localhost RPC server")
     ap.add_argument("--rpc-host", type=str, default="127.0.0.1",
                     help="RPC listen address (default: 127.0.0.1; "
-                         "use 0.0.0.0 for a public launch)")
+                         "use 0.0.0.0 for a public launch -- RPC has no "
+                         "authentication, so only do this behind a firewall)")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {NODE_VERSION}")
     ap.add_argument("--p2p-port", type=int, default=None,
                     help="P2P listen port (0 = disabled; "
                          "default: network's P2P port)")
@@ -287,6 +295,10 @@ def main():
                     help="bootstrap peer host:port (repeatable)")
     ap.add_argument("--datadir", type=str, default="",
                     help="data directory (default: script dir)")
+    ap.add_argument("--wallet-keyfile", type=str, default="",
+                    help="file holding the wallet passphrase (or set "
+                         "EXCALIBUR_WALLET_KEYFILE); needed when the "
+                         "wallet file is encrypted")
     args = ap.parse_args()
 
     signal.signal(signal.SIGTERM, _sig)
@@ -353,6 +365,7 @@ def main():
                       host=args.p2p_host)
     if p2p_port:
         mgr.start()
+        mgr.start_redial()
         log(f"P2P listening on {args.p2p_host}:{p2p_port} "
             f"(magic {mgr.magic:#x})")
         for p in args.peer:
@@ -369,10 +382,16 @@ def main():
         log("P2P disabled")
 
     if not args.no_rpc and rpc_port:
-        node = Node(cs, mempool, lock, wallet_path, peermgr=mgr)
-        node.serve_thread(rpc_port, args.rpc_host)
+        node = Node(cs, mempool, lock, wallet_path, peermgr=mgr,
+                    wallet_keyfile=args.wallet_keyfile or None)
+        node.serve_thread(rpc_port, host=args.rpc_host)
         log(f"RPC up on {args.rpc_host}:{rpc_port}")
+        # Node-local fee market stats: the P2P layer reports every accepted
+        # block's per-tx fee rates (not consensus, just estimatesmartfee
+        # fuel).
+        mgr.on_block = node.record_block_fees
     else:
+        node = None
         log("RPC disabled")
 
     tip = cs.tip()
@@ -384,7 +403,8 @@ def main():
             time.sleep(0.5)
     # The block reward pays this node's wallet key directly — every block
     # found is solo-mined income, no pool required.
-    _miner_priv, miner_pub = load_wallet_key(wallet_path)
+    _miner_priv, miner_pub = load_wallet_key(
+        wallet_path, keyfile=args.wallet_keyfile or None)
     from txscript import hash160 as _h160
     log(f"coinbase pays PKH {_h160(miner_pub).hex()[:16]}.. (this node's wallet)")
     mined = 0
@@ -405,11 +425,20 @@ def main():
             # snapshot for unlocked template validation during mining.
             # UtxoSet.copy() is cheap (shares the immutable snapshot).
             utxo_snap = cs.utxo.copy()
+        # Snapshot activation: at the activation height the coinbase must
+        # push the snapshot hash (consensus-enforced in submit_block).
+        commit = activation_commitment(h, cs.data_dir)
+        extra = [commit] if commit else None
+        if commit:
+            log(f"mining snapshot activation block {h} "
+                f"(committing {commit.hex()[:16]}..)")
         if args.workers > 1:
             res = mine_one_parallel(prev, h, cs, tag, template, utxo_snap,
-                                    args.workers, miner_pub)
+                                    args.workers, miner_pub,
+                                    extra_pushes=extra)
         else:
-            res = mine_one(prev, h, cs, tag, template, utxo_snap, miner_pub)
+            res = mine_one(prev, h, cs, tag, template, utxo_snap, miner_pub,
+                           extra_pushes=extra)
         if res is None:
             break
         blk, dt, hashes, fees = res
@@ -427,6 +456,11 @@ def main():
             else:
                 log(f"!! own block {h} rejected: {sub['reason']}")
                 continue
+        if sub["accepted"] and node is not None:
+            # Node-local fee observation for estimatesmartfee (the template
+            # already carries per-tx fees; not consensus).
+            node.record_block_fees(
+                h, [(len(r), f) for r, f in template])
         mined += 1
         total_hashes += hashes
         total_t += dt

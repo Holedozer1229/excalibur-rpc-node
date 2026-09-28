@@ -1,0 +1,20 @@
+[Unit]
+Description=Excalibur fork peer node (non-mining, independent datadir)
+After=network.target excalibur-fork.service
+Wants=excalibur-fork.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hatch/workspace
+UMask=0007
+# Non-mining fork peer: own datadir, own P2P/RPC ports, bootstraps from the
+# local miner node. Verifies full sync against the miner tip independently.
+ExecStart=/usr/bin/python3 excalibur.py --network fork --no-mine --datadir /home/hatch/workspace/chaindata_fork_peer --p2p-port 9533 --rpc-port 9532 --p2p-host 127.0.0.1 --peer 127.0.0.1:9433
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/hatch/workspace/excalibur_fork_peer.log
+StandardError=append:/home/hatch/workspace/excalibur_fork_peer.log
+
+[Install]
+WantedBy=multi-user.target

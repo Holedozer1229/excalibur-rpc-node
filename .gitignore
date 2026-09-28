@@ -1,0 +1,13 @@
+# Runtime data — never commit chain state, wallets, or logs
+__pycache__/
+*.pyc
+chaindata/
+chaindata_mainnet/
+chaindata_fork/
+*.jsonl
+mempool*.json
+wallet*.json
+*.fees.json
+*.log
+.bridge_token
+.env

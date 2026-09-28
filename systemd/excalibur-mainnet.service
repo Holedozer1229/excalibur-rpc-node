@@ -1,0 +1,17 @@
+[Unit]
+Description=Excalibur mainnet node (serve-only)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hatch/workspace
+UMask=0007
+ExecStart=/usr/bin/python3 excalibur.py --network mainnet --no-mine --p2p-host 0.0.0.0
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/hatch/workspace/excalibur_mainnet.log
+StandardError=append:/home/hatch/workspace/excalibur_mainnet.log
+
+[Install]
+WantedBy=multi-user.target
